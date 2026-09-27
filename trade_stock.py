@@ -253,6 +253,7 @@ def run_dynamic_risk(
     )
 
     open_pos: Optional[Position] = None
+    pending_signal: Optional[Signal] = None  # staged signal waiting for next bar entry
     recent_bars_buffer: list[pd.Series] = []
     trade_history: list[dict] = []
 
@@ -329,10 +330,20 @@ def run_dynamic_risk(
                 })
                 open_pos = None
 
-        # Check new signal entry
-        if open_pos is None and not risk_mgr.is_kill_switch_tripped:
-            if bar_ts in signal_map:
-                sig = signal_map[bar_ts]
+        # -------------------------------------------------------------------
+        # Stage any signal whose 15-min bar just closed at this 1-min timestamp.
+        # The signal was generated AT bar_ts (close of the 15-min window);
+        # we must enter on the NEXT bar — so we only stage here, execute below.
+        # -------------------------------------------------------------------
+        if bar_ts in signal_map and open_pos is None and pending_signal is None:
+            pending_signal = signal_map[bar_ts]
+
+        # Execute a pending signal: we are now one bar past the signal close.
+        if open_pos is None and pending_signal is not None and not risk_mgr.is_kill_switch_tripped:
+            sig = pending_signal
+            # Guard: only enter if this bar is strictly after the signal timestamp
+            sig_ts = pd.to_datetime(sig.timestamp, utc=True)
+            if bar_ts > sig_ts:
                 shares = risk_mgr.calculate_position_size(sig.entry_price, sig.stop_price, sig.regime, sig.atr)
                 if shares > 0:
                     fill_price, entry_fees, filled_qty = route_order(
@@ -346,6 +357,7 @@ def run_dynamic_risk(
                             current_stop=sig.stop_price, tp_price=sig.tp_price, atr=sig.atr,
                             rule=sig.rule, regime=sig.regime, entry_cost=entry_fees,
                         )
+                pending_signal = None  # consumed regardless (avoid stale signal)
 
     n = len(trade_history)
     wins = sum(1 for t in trade_history if t["net_pnl"] > 0)

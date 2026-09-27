@@ -119,7 +119,10 @@ class DataLoader:
             agg_rules["vwap"] = "last"
 
         cols = [c for c in agg_rules if c in self._df_1min.columns]
-        df = self._df_1min[cols].resample(tf).agg(
+        # label='right', closed='right': the bar whose timestamp is T contains
+        # 1-min data from (T - tf, T].  A signal generated at bar T is therefore
+        # only actionable on bars with index > T — perfectly causal, no lookahead.
+        df = self._df_1min[cols].resample(tf, label="right", closed="right").agg(
             {c: agg_rules[c] for c in cols}
         )
         df = df.dropna(subset=["open"])  # drop empty bars

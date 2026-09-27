@@ -12,7 +12,7 @@ def deflated_sharpe_ratio(
     expected_sr: float = 0.0,
     n_trials: int = 1,
     risk_free_rate: float = 0.0,
-    periods_per_year: int = 252 * 24 * 4  # 15m bars
+    periods_per_year: int = 252 * 26  # 15-min equity bars: 6.5h/day × 4 bars/h × 252 days = 6552
 ) -> float:
     """
     Calculate the Deflated Sharpe Ratio (DSR) adjusting for non-normality and multiple testing.

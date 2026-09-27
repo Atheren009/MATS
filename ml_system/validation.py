@@ -132,6 +132,54 @@ def evaluate_signals(signals: List[Signal], df_1min: pd.DataFrame) -> pd.Series:
     return df_r.resample("1D").sum().fillna(0)["pnl"]
 
 
+def _run_fold_stats(
+    fold: int,
+    symbol: str,
+    sig_base: List[Signal],
+    sig_lstm: List[Signal],
+    df_1min_oos: pd.DataFrame,
+    use_lstm: bool,
+    n_trials: int,
+) -> dict:
+    """
+    Shared helper: evaluate signals, compute DSR+SPA stats, log results,
+    and return a fold-result dict.  Used by all three walk-forward variants.
+    """
+    daily_base = evaluate_signals(sig_base, df_1min_oos)
+    daily_lstm = evaluate_signals(sig_lstm, df_1min_oos) if use_lstm else daily_base
+
+    df_ret = pd.concat([daily_lstm.rename("lstm"), daily_base.rename("base")], axis=1).fillna(0.0)
+
+    # --- Statistics ---
+    # periods_per_year = 252*26 (equity 15-min bars; corrected from 252*24*4)
+    dsr   = deflated_sharpe_ratio(df_ret["lstm"], expected_sr=0.0, n_trials=n_trials)
+    spa_p = block_bootstrap_spa(df_ret["lstm"], df_ret["base"])
+
+    base_pnl      = df_ret["base"].sum()
+    lstm_pnl      = df_ret["lstm"].sum()
+    n_trades_base = len(sig_base)
+    n_wins_base   = int((daily_base > 0).sum())
+    win_rate      = round(n_wins_base / n_trades_base * 100, 1) if n_trades_base else 0.0
+    promoted      = (dsr > 0.95 and spa_p < 0.05) if use_lstm else None
+
+    log.info("  Phase 0 PnL: $%.2f  |  Daily win days: %d/%d (%.1f%%)",
+             base_pnl, n_wins_base, len(daily_base[daily_base != 0]), win_rate)
+    if use_lstm:
+        log.info("  Phase 1 PnL: $%.2f  |  DSR: %.3f  |  SPA p: %.4f  |  Gate: %s",
+                 lstm_pnl, dsr, spa_p, "PASSED" if promoted else "FAILED")
+
+    return {
+        "symbol":    symbol,
+        "fold":      fold,
+        "n_signals": n_trades_base,
+        "base_pnl":  round(base_pnl, 2),
+        "lstm_pnl":  round(lstm_pnl, 2) if use_lstm else None,
+        "dsr":       round(dsr, 4)      if use_lstm else None,
+        "spa_p":     round(spa_p, 4)    if use_lstm else None,
+        "promoted":  promoted,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Walk-Forward
 # ---------------------------------------------------------------------------
@@ -199,36 +247,18 @@ def run_walk_forward(symbol: str, n_folds: int = 3, use_lstm: bool = False) -> D
         log.info("  Phase 0 signals: %d  |  Phase 1 (LSTM-filtered): %d", len(sig_base), len(sig_lstm))
 
         # 4. Simulate PnL through Smart Router using 1-min data
-        # Clip 1-min data to OOS window (streaming: no future bars visible)
         oos_start  = df_oos.index[0]
         oos_end_ts = df_oos.index[-1]
         df_1min_oos = df_1min[(df_1min.index >= oos_start) & (df_1min.index <= oos_end_ts)]
 
-        daily_base = evaluate_signals(sig_base, df_1min_oos)
-        daily_lstm = evaluate_signals(sig_lstm, df_1min_oos) if use_lstm else daily_base
+        result = _run_fold_stats(
+            fold=fold + 1, symbol=symbol,
+            sig_base=sig_base, sig_lstm=sig_lstm,
+            df_1min_oos=df_1min_oos,
+            use_lstm=use_lstm, n_trials=fold + 1,
+        )
 
-        df_ret = pd.concat([daily_lstm.rename("lstm"), daily_base.rename("base")], axis=1).fillna(0.0)
-
-        # 5. Statistics
-        dsr   = deflated_sharpe_ratio(df_ret["lstm"], expected_sr=0.0, n_trials=fold + 1)
-        spa_p = block_bootstrap_spa(df_ret["lstm"], df_ret["base"])
-
-        base_pnl = df_ret["base"].sum()
-        lstm_pnl = df_ret["lstm"].sum()
-
-        n_wins_base  = int((daily_base > 0).sum())
-        n_trades_base = len(sig_base)
-        win_rate = round(n_wins_base / n_trades_base * 100, 1) if n_trades_base else 0.0
-
-        promoted = (dsr > 0.95 and spa_p < 0.05) if use_lstm else None
-
-        log.info("  Phase 0 PnL: $%.2f  |  Daily win days: %d/%d (%.1f%%)",
-                 base_pnl, n_wins_base, len(daily_base[daily_base != 0]), win_rate)
-        if use_lstm:
-            log.info("  Phase 1 PnL: $%.2f  |  DSR: %.3f  |  SPA p: %.4f  |  Gate: %s",
-                     lstm_pnl, dsr, spa_p, "PASSED" if promoted else "FAILED")
-
-        # 6. Registry
+        # 5. Registry
         registry.log_training_run(
             symbol=symbol,
             train_start=str(df_train.index[0]),
@@ -241,16 +271,7 @@ def run_walk_forward(symbol: str, n_folds: int = 3, use_lstm: bool = False) -> D
             model_path="",
         )
 
-        fold_results.append({
-            "symbol":      symbol,
-            "fold":        fold + 1,
-            "n_signals":   n_trades_base,
-            "base_pnl":    round(base_pnl, 2),
-            "lstm_pnl":    round(lstm_pnl, 2) if use_lstm else None,
-            "dsr":         round(dsr, 4) if use_lstm else None,
-            "spa_p":       round(spa_p, 4) if use_lstm else None,
-            "promoted":    promoted,
-        })
+        fold_results.append(result)
 
     return fold_results
 
@@ -324,31 +345,14 @@ def run_alternating_walk_forward(symbol: str, use_lstm: bool = False) -> List[Di
         oos_end_ts   = df_oos.index[-1]
         df_1min_oos  = df_1min[(df_1min.index >= oos_start_ts) & (df_1min.index <= oos_end_ts)]
 
-        daily_base = evaluate_signals(sig_base, df_1min_oos)
-        daily_lstm = evaluate_signals(sig_lstm, df_1min_oos) if use_lstm else daily_base
+        result = _run_fold_stats(
+            fold=fold + 1, symbol=symbol,
+            sig_base=sig_base, sig_lstm=sig_lstm,
+            df_1min_oos=df_1min_oos,
+            use_lstm=use_lstm, n_trials=fold + 1,
+        )
 
-        df_ret = pd.concat([daily_lstm.rename("lstm"), daily_base.rename("base")], axis=1).fillna(0.0)
-
-        # 5. Statistics
-        dsr   = deflated_sharpe_ratio(df_ret["lstm"], expected_sr=0.0, n_trials=fold + 1)
-        spa_p = block_bootstrap_spa(df_ret["lstm"], df_ret["base"])
-
-        base_pnl = df_ret["base"].sum()
-        lstm_pnl = df_ret["lstm"].sum()
-
-        n_wins_base  = int((daily_base > 0).sum())
-        n_trades_base = len(sig_base)
-        win_rate = round(n_wins_base / n_trades_base * 100, 1) if n_trades_base else 0.0
-
-        promoted = (dsr > 0.95 and spa_p < 0.05) if use_lstm else None
-
-        log.info("  Phase 0 PnL: $%.2f  |  Daily win days: %d/%d (%.1f%%)",
-                 base_pnl, n_wins_base, len(daily_base[daily_base != 0]), win_rate)
-        if use_lstm:
-            log.info("  Phase 1 PnL: $%.2f  |  DSR: %.3f  |  SPA p: %.4f  |  Gate: %s",
-                     lstm_pnl, dsr, spa_p, "PASSED" if promoted else "FAILED")
-
-        # 6. Registry
+        # 5. Registry
         registry.log_training_run(
             symbol=symbol,
             train_start=str(df_train.index[0]),
@@ -361,16 +365,7 @@ def run_alternating_walk_forward(symbol: str, use_lstm: bool = False) -> List[Di
             model_path="",
         )
 
-        fold_results.append({
-            "symbol":      symbol,
-            "fold":        fold + 1,
-            "n_signals":   n_trades_base,
-            "base_pnl":    round(base_pnl, 2),
-            "lstm_pnl":    round(lstm_pnl, 2) if use_lstm else None,
-            "dsr":         round(dsr, 4) if use_lstm else None,
-            "spa_p":       round(spa_p, 4) if use_lstm else None,
-            "promoted":    promoted,
-        })
+        fold_results.append(result)
 
     return fold_results
 
@@ -475,39 +470,13 @@ def run_fixed_folds(target_symbol: str, fold_windows: List[Dict], anchor_symbol:
         oos_end_ts = df_oos_target.index[-1]
         df_1min_oos = target_1min[(target_1min.index >= oos_start) & (target_1min.index <= oos_end_ts)]
 
-        daily_base = evaluate_signals(sig_base, df_1min_oos)
-        daily_lstm = evaluate_signals(sig_lstm, df_1min_oos) if use_lstm else daily_base
-
-        df_ret = pd.concat([daily_lstm.rename("lstm"), daily_base.rename("base")], axis=1).fillna(0.0)
-
-        dsr   = deflated_sharpe_ratio(df_ret["lstm"], expected_sr=0.0, n_trials=fold)
-        spa_p = block_bootstrap_spa(df_ret["lstm"], df_ret["base"])
-
-        base_pnl = df_ret["base"].sum()
-        lstm_pnl = df_ret["lstm"].sum()
-
-        n_wins_base  = int((daily_base > 0).sum())
-        n_trades_base = len(sig_base)
-        win_rate = round(n_wins_base / n_trades_base * 100, 1) if n_trades_base else 0.0
-
-        promoted = (dsr > 0.95 and spa_p < 0.05) if use_lstm else None
-
-        log.info("  Phase 0 PnL: $%.2f  |  Daily win days: %d/%d (%.1f%%)",
-                 base_pnl, n_wins_base, len(daily_base[daily_base != 0]), win_rate)
-        if use_lstm:
-            log.info("  Phase 1 PnL: $%.2f  |  DSR: %.3f  |  SPA p: %.4f  |  Gate: %s",
-                     lstm_pnl, dsr, spa_p, "PASSED" if promoted else "FAILED")
-
-        fold_results.append({
-            "symbol":      target_symbol,
-            "fold":        fold,
-            "n_signals":   n_trades_base,
-            "base_pnl":    round(base_pnl, 2),
-            "lstm_pnl":    round(lstm_pnl, 2) if use_lstm else None,
-            "dsr":         round(dsr, 4) if use_lstm else None,
-            "spa_p":       round(spa_p, 4) if use_lstm else None,
-            "promoted":    promoted,
-        })
+        result = _run_fold_stats(
+            fold=fold, symbol=target_symbol,
+            sig_base=sig_base, sig_lstm=sig_lstm,
+            df_1min_oos=df_1min_oos,
+            use_lstm=use_lstm, n_trials=fold,
+        )
+        fold_results.append(result)
 
     return fold_results
 

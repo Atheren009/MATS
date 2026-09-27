@@ -1,0 +1,53 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# ── Virtual environments ─────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env
+
+# ── Build artefacts ──────────────────────────────────────────────────────────
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── IDE / editor ─────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+
+# ── Testing / caches ─────────────────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# ── uv lock (keep the lock file for reproducibility) ─────────────────────────
+# uv.lock   <-- intentionally NOT ignored
+
+# ── MATS-specific: generated / runtime files ─────────────────────────────────
+# Retrain registry DB (runtime state, not source)
+ml_system/registry/retrain.db
+
+# Trained model binaries (large — regenerate with train_combined.py)
+ml_system/saved_models/*.pkl
+ml_system/saved_models/*.pt
+ml_system/saved_models/*.pth
+
+# Downloaded price data CSVs (regenerate with AlpacaFetcher)
+Price\ Feed/*.csv
+
+# Trade output CSVs
+results/*.csv
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

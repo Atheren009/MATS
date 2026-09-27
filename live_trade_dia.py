@@ -184,6 +184,7 @@ def run_chronological_simulation(
     )
 
     open_pos: Optional[Position] = None
+    pending_signal: Optional[Signal] = None  # staged signal — entered on the NEXT bar
     recent_bars_buffer: list[pd.Series] = []
     trade_history: list[dict] = []
     dynamic_events_count = {"breakeven": 0, "trailing": 0, "kill_switch": 0}
@@ -327,12 +328,16 @@ def run_chronological_simulation(
                 open_pos = None
 
         # -------------------------------------------------------------------
-        # C. Check for New Signal on 15-min bar completion
+        # C. Stage signal at 15-min bar close; enter on the NEXT 1-min bar
         # -------------------------------------------------------------------
-        if open_pos is None and not risk_mgr.is_kill_switch_tripped:
-            if bar_ts in signal_map:
-                sig = signal_map[bar_ts]
+        if bar_ts in signal_map and open_pos is None and pending_signal is None:
+            pending_signal = signal_map[bar_ts]
 
+        # Execute pending signal on the first bar strictly AFTER signal close
+        if open_pos is None and pending_signal is not None and not risk_mgr.is_kill_switch_tripped:
+            sig = pending_signal
+            sig_ts = pd.to_datetime(sig.timestamp, utc=True)
+            if bar_ts > sig_ts:
                 # Dynamic Position Sizing
                 shares = risk_mgr.calculate_position_size(
                     entry_price=sig.entry_price,
@@ -368,6 +373,7 @@ def run_chronological_simulation(
                             log.info("  [%s] NEW POSITION: %s %d DIA @ $%.2f | Stop: $%.2f | TP: $%.2f | DD: %.1f%%",
                                      str(bar_ts)[:19], sig.direction.upper(), filled_qty, fill_price,
                                      sig.stop_price, sig.tp_price, risk_mgr.current_drawdown_pct)
+                pending_signal = None  # consumed
 
         # -------------------------------------------------------------------
         # D. Streaming HUD Display
@@ -442,8 +448,10 @@ def run_live_alpaca_polling(
     risk_pct: float = 1.0,
 ) -> None:
     """
-    Connects to Alpaca API in real-time, fetching incoming 1-min bars every minute,
-    updating the 10% drawdown circuit breaker and dynamic trailing stop live.
+    Connects to Alpaca API in real-time, fetching incoming 1-min bars every minute.
+    Maintains a rolling 1-min buffer, resamples to 15-min bars on each tick,
+    generates signals using the anchor HMM brain, and executes trades through the
+    Smart Order Router with full 10% drawdown circuit breaker and trailing stop logic.
     """
     log.info("=" * 75)
     log.info("LIVE REAL-TIME ALPACA TRADER — DOW JONES (DIA)")
@@ -457,15 +465,25 @@ def run_live_alpaca_polling(
         base_risk_pct=risk_pct,
     )
     models = load_anchor_models()
+    generator = BaselineSignalGenerator(DIA_SYMBOL)
 
-    log.info("Connected to Alpaca. Warming up 1-minute historical buffer...")
+    # --- Warm up: prime the 1-min buffer with recent history ---
+    log.info("Warming up 1-minute historical buffer (5 days)...")
     now = datetime.now(timezone.utc)
     start_warmup = now - pd.Timedelta(days=5)
     df_buffer = fetcher.fetch(DIA_SYMBOL, start_warmup, now, timeframe_minutes=1)
-    log.info("Buffer primed with %d historical 1-min bars.", len(df_buffer))
+    log.info("Buffer primed with %d 1-min bars.", len(df_buffer))
 
     last_processed_ts = df_buffer.index[-1] if not df_buffer.empty else None
     open_pos: Optional[Position] = None
+    pending_signal: Optional[Signal] = None
+    recent_bars_buffer: list[pd.Series] = []
+    # Pre-fill recent bars buffer from warmup
+    for _, row in df_buffer.tail(10).iterrows():
+        recent_bars_buffer.append(row)
+
+    # Track the last 15-min signal timestamp we acted on (avoid duplicate signals)
+    last_signal_ts: Optional[pd.Timestamp] = None
 
     log.info("Starting live polling loop (press Ctrl+C to stop)...")
     try:
@@ -484,6 +502,13 @@ def run_live_alpaca_polling(
 
             for bar_ts, row in new_bars.iterrows():
                 last_processed_ts = bar_ts
+
+                # Append to rolling buffer
+                df_buffer = pd.concat([df_buffer, pd.DataFrame([row], index=[bar_ts])])
+                recent_bars_buffer.append(row)
+                if len(recent_bars_buffer) > 10:
+                    recent_bars_buffer.pop(0)
+
                 current_price = float(row.close)
                 high = float(row.high)
                 low = float(row.low)
@@ -491,14 +516,28 @@ def run_live_alpaca_polling(
                 # Mark to market & Drawdown check
                 equity = risk_mgr.mark_to_market(current_price, open_pos)
 
+                # Kill switch
                 if risk_mgr.is_kill_switch_tripped:
-                    log.warning("[%s] KILL SWITCH TRIPPED! Drawdown %.2f%% >= %.1f%%. Halting!",
+                    log.warning("[%s] KILL SWITCH TRIPPED! DD %.2f%% >= %.1f%%. Halting all new orders.",
                                 str(bar_ts)[:19], risk_mgr.current_drawdown_pct, max_dd)
-                    if open_pos:
-                        open_pos = None  # In live, bracket/stop will handle or submit market exit
+                    if open_pos is not None:
+                        fill_price, exit_fees, _ = route_order(
+                            symbol=DIA_SYMBOL,
+                            side=OrderSide.SELL if open_pos.direction == "long" else OrderSide.BUY,
+                            qty=open_pos.qty,
+                            recent_bars=recent_bars_buffer,
+                        )
+                        gross = (fill_price - open_pos.entry_price) * open_pos.qty if open_pos.direction == "long" \
+                                else (open_pos.entry_price - fill_price) * open_pos.qty
+                        net_pnl = gross - open_pos.entry_cost - exit_fees
+                        risk_mgr.close_position(net_pnl, open_pos.entry_cost + exit_fees)
+                        log.warning("[%s] Emergency exit at $%.2f. Net PnL: $%.2f",
+                                    str(bar_ts)[:19], fill_price, net_pnl)
+                        open_pos = None
+                    pending_signal = None
                     continue
 
-                # Check position management
+                # Manage open position: trailing stop & SL/TP
                 if open_pos is not None:
                     new_stop, update_event = risk_mgr.update_stops_and_targets(open_pos, high, low, current_price)
                     if update_event == "breakeven_locked":
@@ -506,8 +545,103 @@ def run_live_alpaca_polling(
                     elif update_event in ("trailing_stop_raised", "trailing_stop_lowered"):
                         log.info("[%s] Dynamic Risk: Trailing Stop adjusted to $%.2f", str(bar_ts)[:19], new_stop)
 
+                    exit_triggered = False
+                    outcome = ""
+                    raw_exit_price = current_price
+                    if open_pos.direction == "long":
+                        if low <= open_pos.current_stop:
+                            raw_exit_price = open_pos.current_stop
+                            outcome = "TRAIL_SL" if open_pos.is_trailing_active else ("BE" if open_pos.is_breakeven_set else "SL")
+                            exit_triggered = True
+                        elif high >= open_pos.tp_price:
+                            raw_exit_price = open_pos.tp_price
+                            outcome = "TP"
+                            exit_triggered = True
+                    else:
+                        if high >= open_pos.current_stop:
+                            raw_exit_price = open_pos.current_stop
+                            outcome = "TRAIL_SL" if open_pos.is_trailing_active else ("BE" if open_pos.is_breakeven_set else "SL")
+                            exit_triggered = True
+                        elif low <= open_pos.tp_price:
+                            raw_exit_price = open_pos.tp_price
+                            outcome = "TP"
+                            exit_triggered = True
+
+                    if exit_triggered:
+                        fill_price, exit_fees, _ = route_order(
+                            symbol=DIA_SYMBOL,
+                            side=OrderSide.SELL if open_pos.direction == "long" else OrderSide.BUY,
+                            qty=open_pos.qty,
+                            recent_bars=recent_bars_buffer,
+                        )
+                        if fill_price == 0:
+                            fill_price = raw_exit_price
+                        gross = (fill_price - open_pos.entry_price) * open_pos.qty if open_pos.direction == "long" \
+                                else (open_pos.entry_price - fill_price) * open_pos.qty
+                        net_pnl = gross - open_pos.entry_cost - exit_fees
+                        risk_mgr.close_position(net_pnl, open_pos.entry_cost + exit_fees)
+                        log.info("[%s] EXIT %s %s %dx @ $%.2f | %s PnL: $%.2f | Equity: $%.2f",
+                                 str(bar_ts)[:19], outcome, open_pos.direction.upper(),
+                                 open_pos.qty, fill_price, outcome,
+                                 net_pnl, risk_mgr.equity)
+                        open_pos = None
+
+                # Generate fresh signals from the rolling buffer (every 15-min bar boundary)
+                if open_pos is None and not risk_mgr.is_kill_switch_tripped:
+                    loader_live = DataLoader(DIA_SYMBOL)
+                    loader_live.set_dataframe(df_buffer)
+                    try:
+                        df_15min_live = loader_live.resample("15min")
+                        df_feat_live = loader_live.compute_features(df_15min_live)
+                        if len(df_feat_live) >= 20:  # need warmup bars for indicators
+                            regimes_live = majority_vote_regimes(models, df_feat_live)
+                            new_signals = generator.generate(df_feat_live.iloc[-1:], regimes_live.iloc[-1:])
+                            for sig in new_signals:
+                                sig_ts = pd.to_datetime(sig.timestamp, utc=True)
+                                if last_signal_ts is None or sig_ts > last_signal_ts:
+                                    # Stage for next-bar entry
+                                    pending_signal = sig
+                                    last_signal_ts = sig_ts
+                                    log.info("[%s] SIGNAL: %s %s (Rule: %s | Entry: $%.2f | Stop: $%.2f | TP: $%.2f)",
+                                             str(bar_ts)[:19], sig.direction.upper(), DIA_SYMBOL,
+                                             sig.rule, sig.entry_price, sig.stop_price, sig.tp_price)
+                    except Exception as e:
+                        log.debug("Live feature computation skipped: %s", e)
+
+                # Execute pending signal on the first bar after signal close
+                if open_pos is None and pending_signal is not None and not risk_mgr.is_kill_switch_tripped:
+                    sig = pending_signal
+                    sig_ts = pd.to_datetime(sig.timestamp, utc=True)
+                    if bar_ts > sig_ts:
+                        shares = risk_mgr.calculate_position_size(
+                            entry_price=sig.entry_price,
+                            stop_price=sig.stop_price,
+                            regime=sig.regime,
+                            atr=sig.atr,
+                        )
+                        if shares > 0:
+                            fill_price, entry_fees, filled_qty = route_order(
+                                symbol=DIA_SYMBOL,
+                                side=OrderSide.BUY if sig.direction == "long" else OrderSide.SELL,
+                                qty=shares,
+                                recent_bars=recent_bars_buffer,
+                            )
+                            if filled_qty > 0:
+                                open_pos = Position(
+                                    symbol=DIA_SYMBOL, direction=sig.direction,
+                                    entry_time=str(bar_ts), entry_price=fill_price,
+                                    qty=filled_qty, initial_stop=sig.stop_price,
+                                    current_stop=sig.stop_price, tp_price=sig.tp_price,
+                                    atr=sig.atr, rule=sig.rule, regime=sig.regime,
+                                    entry_cost=entry_fees,
+                                )
+                                log.info("[%s] ENTRY: %s %d DIA @ $%.2f | Stop: $%.2f | TP: $%.2f | Equity: $%.2f",
+                                         str(bar_ts)[:19], sig.direction.upper(), filled_qty,
+                                         fill_price, sig.stop_price, sig.tp_price, risk_mgr.equity)
+                        pending_signal = None
+
                 # Status log
-                pos_str = f"{open_pos.direction.upper()} {open_pos.qty}x" if open_pos else "FLAT"
+                pos_str = f"{open_pos.direction.upper()} {open_pos.qty}x@${open_pos.entry_price:.2f}" if open_pos else "FLAT"
                 log.info(
                     "[%s] DIA: $%.2f | Equity: $%.2f | HWM: $%.2f | DD: %.2f%%/%.1f%% | %s",
                     str(bar_ts)[:19], current_price, equity, risk_mgr.high_water_mark,
@@ -515,7 +649,7 @@ def run_live_alpaca_polling(
                 )
 
     except KeyboardInterrupt:
-        log.info("Live polling stopped by user.")
+        log.info("Live polling stopped by user. Final equity: $%.2f", risk_mgr.equity)
 
 
 # ---------------------------------------------------------------------------
