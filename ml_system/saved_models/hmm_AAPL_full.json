@@ -1,0 +1,16 @@
+{
+  "symbol": "AAPL",
+  "trained_at": "2026-09-27T16:21:49.770979+00:00",
+  "train_bars_15min": 37715,
+  "train_bars_1min_approx": 447900,
+  "date_start": "2024-01-02",
+  "date_end": "2026-05-20",
+  "regime_distribution": {
+    "trending": 0.1718,
+    "ranging": 0.4867,
+    "high_vol_breakout": 0.1054,
+    "low_liquidity": 0.2362
+  },
+  "feature_hash": "f8d3f2b1694a7ea4",
+  "model_path": "B:\\Order Router Python\\ml_system\\saved_models\\hmm_AAPL_full.pkl"
+}

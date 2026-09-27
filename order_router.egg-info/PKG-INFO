@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: order-router
+Version: 0.1.0
+Requires-Python: >=3.11
+Requires-Dist: sortedcontainers>=2.4.0
+Requires-Dist: pandas>=2.0.0
+Requires-Dist: matplotlib>=3.8.0
+Requires-Dist: numpy>=1.26.0
+Requires-Dist: hmmlearn>=0.3.0
+Requires-Dist: scikit-learn>=1.4.0
+Requires-Dist: alpaca-py>=0.29.0
+Requires-Dist: requests>=2.31.0
+Requires-Dist: yfinance>=0.2.0
+Requires-Dist: torch>=2.0.0

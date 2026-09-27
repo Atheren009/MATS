@@ -1,0 +1,28 @@
+[project]
+name = "order-router"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "sortedcontainers>=2.4.0",
+    "pandas>=2.0.0",
+    "matplotlib>=3.8.0",
+    "numpy>=1.26.0",
+    "hmmlearn>=0.3.0",
+    "scikit-learn>=1.4.0",
+    "alpaca-py>=0.29.0",
+    "requests>=2.31.0",
+    "yfinance>=0.2.0",
+    "torch>=2.0.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["order_router*"]   # only ship the actual package; ignore results/, scripts/, tests/
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]            # makes `order_router` importable when running pytest
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]

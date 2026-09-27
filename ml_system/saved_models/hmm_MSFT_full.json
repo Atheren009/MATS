@@ -1,0 +1,16 @@
+{
+  "symbol": "MSFT",
+  "trained_at": "2026-09-27T16:22:02.116139+00:00",
+  "train_bars_15min": 35624,
+  "train_bars_1min_approx": 393939,
+  "date_start": "2024-01-02",
+  "date_end": "2026-05-20",
+  "regime_distribution": {
+    "trending": 0.2104,
+    "ranging": 0.3076,
+    "high_vol_breakout": 0.1323,
+    "low_liquidity": 0.3497
+  },
+  "feature_hash": "f8d3f2b1694a7ea4",
+  "model_path": "B:\\Order Router Python\\ml_system\\saved_models\\hmm_MSFT_full.pkl"
+}

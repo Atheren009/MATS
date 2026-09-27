@@ -1,0 +1,5 @@
+strategy,warm_p50_us,warm_p99_us,lat_delta_vs_bp_us,avg_is_bps,is_saving_bps,dollar_per_order,fill_rate_pct
+BestPrice,55.0,200.0,0.0,4.329,0.0,0.0,46.1
+TWAP(5),111.1,552.7,352.7,3.47,0.859,81.19,56.2
+VWAP(5),113.1,994.2,794.2,3.437,0.892,84.29,60.3
+Smart,173.4,1147.6,947.6,4.46,-0.132,-12.43,52.8
