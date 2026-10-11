@@ -36,6 +36,7 @@ coverage.xml
 # ── MATS-specific: generated / runtime files ─────────────────────────────────
 # Retrain registry DB (runtime state, not source)
 ml_system/registry/retrain.db
+ml_system/registry/agent_registry.db
 
 # Trained model binaries (large — regenerate with train_combined.py)
 ml_system/saved_models/*.pkl

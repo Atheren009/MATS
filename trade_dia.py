@@ -2,12 +2,11 @@
 trade_dia.py
 ============
 Standalone Dow Jones (DIA — SPDR Dow Jones Industrial Average ETF) trader
-using pre-trained anchor HMM models (AAPL + MSFT + SPY).
+using a DIA-specific self-trained HMM for regime classification.
 
-Fetches / loads 1-min data from Alpaca, resamples to 15-min, applies majority-vote
-regime classification from the pre-trained models, generates trading signals,
-and simulates trade execution through the Smart Order Router with realistic slippage
-and venue fees.
+Each ticker should use its own HMM trained on its own data.
+Cross-market majority voting from AAPL/MSFT/SPY caused regime mis-labelling
+and degraded performance.  This script uses DIA's own HMM.
 
 Usage:
     # Run backtest on local DIA data (fetched from Alpaca)
@@ -51,57 +50,40 @@ logging.basicConfig(
 log = logging.getLogger("trade_dia")
 
 DIA_SYMBOL = "DIA"
-ANCHOR_SYMBOLS = ["AAPL", "MSFT", "SPY"]
 
 
 # ---------------------------------------------------------------------------
-# Step 1 — Load pre-trained HMM models from disk
+# Step 1 — Load DIA's own self-trained HMM
 # ---------------------------------------------------------------------------
 
-def load_anchor_models() -> dict[str, RegimeHMM]:
+def load_dia_model() -> RegimeHMM:
     """
-    Load all three pre-trained HMMs from saved_models/.
-    Raises FileNotFoundError if a model is missing (run train_combined.py first).
+    Load DIA's own HMM from saved_models/.
+    Falls back to SPY (closest correlated index) if DIA model is not found.
+    Run train_combined.py to generate the DIA-specific model.
     """
-    models = {}
-    for sym in ANCHOR_SYMBOLS:
-        path = MODEL_DIR / f"hmm_{sym}_full.pkl"
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Trained model not found: {path}\n"
-                f"Run 'python train_combined.py' first to build the models."
-            )
-        models[sym] = RegimeHMM.load(path)
-        log.info("Loaded HMM: %s (trained on %s data)", sym, models[sym].symbol)
-    return models
+    # Primary: DIA's own self-trained HMM
+    dia_path = MODEL_DIR / "hmm_DIA_full.pkl"
+    if dia_path.exists():
+        model = RegimeHMM.load(dia_path)
+        log.info("Loaded DIA self-trained HMM (best regime accuracy)")
+        return model
 
+    # Fallback: SPY (high correlation with DIA, both large-cap US equities)
+    spy_path = MODEL_DIR / "hmm_SPY_full.pkl"
+    if spy_path.exists():
+        log.warning(
+            "DIA self-model not found at %s. "
+            "Falling back to SPY HMM (correlated large-cap US index). "
+            "Run 'python train_combined.py' to generate the DIA-specific model.",
+            dia_path,
+        )
+        return RegimeHMM.load(spy_path)
 
-# ---------------------------------------------------------------------------
-# Step 2 — Majority-vote regime from all 3 anchor models
-# ---------------------------------------------------------------------------
-
-def majority_vote_regime(
-    hmm_models: dict[str, RegimeHMM],
-    df_features: pd.DataFrame,
-) -> pd.Series:
-    """
-    Apply all 3 anchor HMMs to DIA feature bars and take majority vote.
-    """
-    predictions = {}
-    for sym, hmm in hmm_models.items():
-        predictions[sym] = hmm.predict(df_features)
-
-    pred_df = pd.DataFrame(predictions, index=df_features.index)
-
-    # Majority vote: most frequent label across the 3 columns
-    regime_vote = pred_df.mode(axis=1)[0]
-    regime_vote.name = "regime"
-
-    # Log distribution
-    dist = regime_vote.value_counts(normalize=True).round(3).to_dict()
-    log.info("Majority-vote regime distribution on DIA: %s", dist)
-
-    return regime_vote
+    raise FileNotFoundError(
+        f"No HMM model found for DIA.\n"
+        f"Run  python train_combined.py  first to build the models."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +96,11 @@ def simulate_trade(signal: Signal, df_1min: pd.DataFrame, qty: int = 500) -> tup
     Returns (net_pnl, outcome).
     """
     sig_time = pd.to_datetime(signal.timestamp, utc=True)
-    future = df_1min[df_1min.index > sig_time]
+    # Entry must be at or after the bar's close (sig_time is the bar open label;
+    # a 15-min bar closes at sig_time + 15 min).  Bars strictly inside the signal
+    # window must not be used — this is the lookahead guard.
+    bar_close = sig_time + pd.Timedelta(minutes=15)
+    future = df_1min[df_1min.index >= bar_close]
     if len(future) < 6:
         return 0.0, "insufficient_data"
 
@@ -191,8 +177,7 @@ def run(
 ) -> None:
 
     log.info("=" * 65)
-    log.info("DOW JONES (DIA) TRADER — Alpaca 1-min Data")
-    log.info("Anchor Models: AAPL + MSFT + SPY (majority vote)")
+    log.info("DOW JONES (DIA) TRADER — self-trained HMM (no cross-market vote)")
     log.info("=" * 65)
 
     # 1. Fetch from Alpaca if requested or missing
@@ -205,8 +190,8 @@ def run(
         df_fetched = fetcher.fetch(DIA_SYMBOL, fetch_start, fetch_end, timeframe_minutes=1)
         log.info("Fetched %d 1-min bars from Alpaca and saved to CSV", len(df_fetched))
 
-    # 2. Load anchor models
-    hmm_models = load_anchor_models()
+    # 2. Load DIA's own HMM
+    hmm = load_dia_model()
 
     # 3. Load DIA data
     loader = DataLoader(DIA_SYMBOL)
@@ -229,12 +214,18 @@ def run(
         df_features.index[-1].date(),
     )
 
-    # 5. Regime classification via majority vote
-    log.info("Computing regime via majority vote across anchor models...")
-    regimes = majority_vote_regime(hmm_models, df_features)
+    # 5. Self-regime classification
+    log.info("Classifying DIA regime with DIA-specific HMM...")
+    regimes = hmm.predict(df_features)
+    dist = regimes.value_counts(normalize=True).round(3).to_dict()
+    log.info("DIA regime distribution: %s", dist)
 
-    # 6. Generate signals
-    gen = BaselineSignalGenerator(symbol=DIA_SYMBOL)
+    # 6. Generate signals — DIA-specific thresholds (lower body/vol for low-vol ETF)
+    gen = BaselineSignalGenerator(
+        symbol=DIA_SYMBOL,
+        body_confirm=0.40,   # DIA has smaller candle bodies than QQQ
+        vol_confirm=1.05,    # Slightly lower vol bar required
+    )
     signals = gen.generate(df_features, regimes)
 
     if not signals:
@@ -301,7 +292,7 @@ def run(
     log.info("SUMMARY — DOW JONES (DIA)")
     log.info("  Symbol         : DIA (SPDR Dow Jones Industrial Average ETF)")
     log.info("  Source         : Alpaca 1-min Data")
-    log.info("  Model          : AAPL + MSFT + SPY HMMs (majority vote)")
+    log.info("  Regime model   : DIA self-trained HMM")
     log.info("  Total signals  : %d", n)
     log.info("  Wins           : %d", wins)
     log.info("  Losses         : %d", losses)

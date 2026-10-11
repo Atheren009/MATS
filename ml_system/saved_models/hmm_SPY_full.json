@@ -1,15 +1,15 @@
 {
   "symbol": "SPY",
-  "trained_at": "2026-09-27T16:22:08.198939+00:00",
-  "train_bars_15min": 18898,
+  "trained_at": "2026-09-28T05:31:52.775849+00:00",
+  "train_bars_15min": 19465,
   "train_bars_1min_approx": 264458,
   "date_start": "2024-01-02",
   "date_end": "2026-09-18",
   "regime_distribution": {
-    "trending": 0.1532,
-    "ranging": 0.4064,
-    "high_vol_breakout": 0.1047,
-    "low_liquidity": 0.3357
+    "trending": 0.1414,
+    "ranging": 0.4205,
+    "high_vol_breakout": 0.0882,
+    "low_liquidity": 0.3499
   },
   "feature_hash": "f8d3f2b1694a7ea4",
   "model_path": "B:\\Order Router Python\\ml_system\\saved_models\\hmm_SPY_full.pkl"

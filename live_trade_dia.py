@@ -121,6 +121,15 @@ def route_order(
     return fill_price, result.total_fees, result.total_filled
 
 
+def levels_from_actual_fill(signal: Signal, fill_price: float) -> tuple[float, float]:
+    """Keep the signal's ATR risk/reward distances after a delayed fill."""
+    stop_distance = abs(signal.entry_price - signal.stop_price)
+    target_distance = abs(signal.tp_price - signal.entry_price)
+    if signal.direction == "long":
+        return fill_price - stop_distance, fill_price + target_distance
+    return fill_price + stop_distance, fill_price - target_distance
+
+
 # ---------------------------------------------------------------------------
 # Chronological Live Price Simulation Engine
 # ---------------------------------------------------------------------------
@@ -586,20 +595,25 @@ def run_live_alpaca_polling(
                                  net_pnl, risk_mgr.equity)
                         open_pos = None
 
-                # Generate fresh signals from the rolling buffer (every 15-min bar boundary)
-                if open_pos is None and not risk_mgr.is_kill_switch_tripped:
+                # Generate fresh signals at 15-min bar boundaries only.
+                # The signal generator needs >= 3 bars for shift() to work; passing
+                # only iloc[-1:] always produces zero signals (loop starts at i=2).
+                # Detect boundary: this 1-min bar minute is a multiple of 15.
+                at_15min_boundary = (bar_ts.minute % 15 == 0)
+                if at_15min_boundary and open_pos is None and not risk_mgr.is_kill_switch_tripped:
                     loader_live = DataLoader(DIA_SYMBOL)
                     loader_live.set_dataframe(df_buffer)
                     try:
                         df_15min_live = loader_live.resample("15min")
-                        df_feat_live = loader_live.compute_features(df_15min_live)
+                        df_feat_live  = loader_live.compute_features(df_15min_live)
                         if len(df_feat_live) >= 20:  # need warmup bars for indicators
                             regimes_live = majority_vote_regimes(models, df_feat_live)
-                            new_signals = generator.generate(df_feat_live.iloc[-1:], regimes_live.iloc[-1:])
+                            # Run generator over all features so the shift() windows work;
+                            # deduplicate via last_signal_ts so stale signals are ignored.
+                            new_signals = generator.generate(df_feat_live, regimes_live)
                             for sig in new_signals:
                                 sig_ts = pd.to_datetime(sig.timestamp, utc=True)
                                 if last_signal_ts is None or sig_ts > last_signal_ts:
-                                    # Stage for next-bar entry
                                     pending_signal = sig
                                     last_signal_ts = sig_ts
                                     log.info("[%s] SIGNAL: %s %s (Rule: %s | Entry: $%.2f | Stop: $%.2f | TP: $%.2f)",
@@ -608,11 +622,14 @@ def run_live_alpaca_polling(
                     except Exception as e:
                         log.debug("Live feature computation skipped: %s", e)
 
-                # Execute pending signal on the first bar after signal close
+                # Execute pending signal -- only on bars at or after the 15-min bar close.
+                # sig.timestamp is the bar open label; bar closes at sig_ts + 15 min.
+                # This mirrors the lookahead guard used in run_chronological_simulation.
                 if open_pos is None and pending_signal is not None and not risk_mgr.is_kill_switch_tripped:
                     sig = pending_signal
-                    sig_ts = pd.to_datetime(sig.timestamp, utc=True)
-                    if bar_ts > sig_ts:
+                    sig_ts    = pd.to_datetime(sig.timestamp, utc=True)
+                    bar_close = sig_ts + pd.Timedelta(minutes=15)
+                    if bar_ts >= bar_close:
                         shares = risk_mgr.calculate_position_size(
                             entry_price=sig.entry_price,
                             stop_price=sig.stop_price,
@@ -638,7 +655,7 @@ def run_live_alpaca_polling(
                                 log.info("[%s] ENTRY: %s %d DIA @ $%.2f | Stop: $%.2f | TP: $%.2f | Equity: $%.2f",
                                          str(bar_ts)[:19], sig.direction.upper(), filled_qty,
                                          fill_price, sig.stop_price, sig.tp_price, risk_mgr.equity)
-                        pending_signal = None
+                        pending_signal = None  # consumed regardless (avoid stale signal)
 
                 # Status log
                 pos_str = f"{open_pos.direction.upper()} {open_pos.qty}x@${open_pos.entry_price:.2f}" if open_pos else "FLAT"
@@ -684,4 +701,3 @@ if __name__ == "__main__":
             start_date=args.start,
             end_date=args.end,
         )
-

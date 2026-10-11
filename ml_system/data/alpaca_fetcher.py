@@ -173,16 +173,28 @@ class AlpacaFetcher:
         else:
             tf = TimeFrame(timeframe_minutes, TimeFrameUnit.Minute)
 
-        request = StockBarsRequest(
-            symbol_or_symbols=[symbol],
-            timeframe=tf,
-            start=start,
-            end=end,
-            feed=DataFeed.IEX,
-        )
+        df = pd.DataFrame()
+        # Try SIP feed first (complete market coverage), fallback to IEX
+        for feed in [DataFeed.SIP, DataFeed.IEX]:
+            try:
+                request = StockBarsRequest(
+                    symbol_or_symbols=[symbol],
+                    timeframe=tf,
+                    start=start,
+                    end=end,
+                    feed=feed,
+                )
+                bars = self._alpaca_client.get_stock_bars(request)
+                if bars.df is not None and not bars.df.empty:
+                    df = bars.df
+                    log.info("  Alpaca %s feed returned %d bars for %s", feed.value, len(df), symbol)
+                    break
+            except Exception as exc:
+                log.debug("Alpaca feed %s error for %s: %s", feed, symbol, exc)
 
-        bars = self._alpaca_client.get_stock_bars(request)
-        df = bars.df
+        if df.empty:
+            log.warning("No bars returned from Alpaca for %s", symbol)
+            return pd.DataFrame()
 
         if isinstance(df.index, pd.MultiIndex):
             df = df.droplevel("symbol")

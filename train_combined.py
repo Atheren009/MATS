@@ -32,7 +32,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("train_combined")
 
+# Anchor symbols: trained on their own full data, used as regime classifiers
 ANCHOR_SYMBOLS = ["AAPL", "MSFT", "SPY"]
+
+# Tradeable symbols: each gets its OWN self-trained HMM (best regime accuracy)
+TRADE_SYMBOLS = ["QQQ", "DIA", "DAX", "EWG"]
+
+# All symbols to train
+ALL_TRAIN_SYMBOLS = ANCHOR_SYMBOLS + TRADE_SYMBOLS
 
 
 def train_and_save(symbol: str) -> Path:
@@ -92,7 +99,7 @@ def train_and_save(symbol: str) -> Path:
 
 if __name__ == "__main__":
     saved = {}
-    for sym in ANCHOR_SYMBOLS:
+    for sym in ALL_TRAIN_SYMBOLS:
         path = train_and_save(sym)
         saved[sym] = str(path)
 
@@ -103,4 +110,5 @@ if __name__ == "__main__":
     for sym, path in saved.items():
         log.info("  %-6s → %s", sym, path)
     log.info("")
-    log.info("Next step: run  python trade_qqq.py")
+    log.info("Each ticker uses its OWN self-trained HMM for maximum regime accuracy.")
+    log.info("Next step: run  python trade_qqq.py  or  python trade_dia.py")

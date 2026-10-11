@@ -170,6 +170,76 @@ class RegimeHMM:
         return pd.DataFrame(probs, index=df.index, columns=col_names)
 
     # ------------------------------------------------------------------
+    # Expanding-window causal decode (B5 — measurement only)
+    # ------------------------------------------------------------------
+
+    def predict_expanding(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Causal (expanding-window) decode: for bar t, decode only df.iloc[:t+1].
+
+        This is the online-realistic path — no future bars leak into the decode.
+        Full-sequence batch Viterbi (predict()) can use future observations to
+        smooth the path backwards, which is unavailable at signal time.
+
+        Cost: O(T^2 * D) — slow for long DataFrames.  Intended for OOS
+        measurement windows only, not production.
+
+        Returns a Series with the same index as df.
+        """
+        if not self._fitted:
+            raise RuntimeError("HMM not fitted — call .fit() first")
+
+        self._validate_features(df)
+        X_all = df[self.feature_cols].values.copy()
+        X_all = self._scaler.transform(X_all)
+        X_all = np.nan_to_num(X_all, nan=0.0, posinf=0.0, neginf=0.0)
+
+        labels_out = []
+        for t in range(len(X_all)):
+            # Viterbi decode on the expanding prefix df.iloc[:t+1]
+            raw_state = self.model.predict(X_all[:t + 1])[-1]
+            labels_out.append(self._state_labels.get(raw_state, f"state_{raw_state}"))
+
+        return pd.Series(labels_out, index=df.index, name="regime_expanding")
+
+    def compare_expanding_vs_batch(
+        self, df: pd.DataFrame
+    ) -> dict:
+        """
+        Run both decode modes on df and report disagreement statistics.
+
+        Returns a dict with:
+            total_bars     : int
+            disagree_bars  : int
+            disagree_pct   : float   (0-100)
+            per_regime     : dict mapping regime label -> disagree count
+
+        Call this on an OOS window after fitting on train to measure
+        how much the batch Viterbi lookahead inflates regime certainty.
+        Do not call on very large DataFrames (expanding decode is O(T^2)).
+        """
+        batch    = self.predict(df)
+        expanding = self.predict_expanding(df)
+
+        disagree = (batch != expanding)
+        per_regime: dict[str, int] = {}
+        for regime in batch.unique():
+            mask = batch == regime
+            per_regime[regime] = int(disagree[mask].sum())
+
+        result = {
+            "total_bars":   len(df),
+            "disagree_bars": int(disagree.sum()),
+            "disagree_pct":  round(float(disagree.mean()) * 100, 2),
+            "per_regime":   per_regime,
+        }
+        log.info(
+            "Batch vs Expanding decode disagreement on %s: %d/%d bars (%.2f%%)",
+            self.symbol, result["disagree_bars"], result["total_bars"], result["disagree_pct"],
+        )
+        return result
+
+    # ------------------------------------------------------------------
     # State labelling
     # ------------------------------------------------------------------
 

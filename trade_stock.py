@@ -129,7 +129,10 @@ def run_previous_risk(symbol: str, df_1min: pd.DataFrame, signals: list[Signal],
 
     for sig in signals:
         sig_time = pd.to_datetime(sig.timestamp, utc=True)
-        future = df_1min[df_1min.index > sig_time]
+        # sig_time is the 15-min bar's open label; bar closes at sig_time + 15 min.
+        # Must not fill on any 1-min bar inside the signal window.
+        bar_close = sig_time + pd.Timedelta(minutes=15)
+        future = df_1min[df_1min.index >= bar_close]
         if len(future) < 6:
             continue
 

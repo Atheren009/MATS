@@ -14,8 +14,12 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import torch
-from torch.utils.data import Dataset
+try:
+    import torch
+    from torch.utils.data import Dataset
+except ImportError:
+    torch = None
+    Dataset = object
 
 from ..config import (
     CSV_PATHS,
@@ -178,6 +182,12 @@ class DataLoader:
         # --- EMA 9 / 21 (for baseline crossover signals) ---
         out["ema_fast"] = out["close"].ewm(span=EMA_FAST, adjust=False).mean()
         out["ema_slow"] = out["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+
+        # --- EMA 200 (primary trend direction — bull or bear bias) ---
+        # On 15-min bars, EMA200 spans ~50 hours of price action (~3 trading days)
+        # This is our "trend compass": above = bullish, below = bearish
+        out["ema_trend"] = out["close"].ewm(span=200, adjust=False).mean()
+        out["trend_bias"] = (out["close"] > out["ema_trend"]).astype(int)  # 1=bullish, 0=bearish
 
         # --- RSI(14) ---
         delta = out["close"].diff()

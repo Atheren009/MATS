@@ -192,9 +192,11 @@ class DynamicRiskManager:
             return 0
 
         # Raw volatility-based share size
+        # Never force a minimum share. A one-share order can exceed the
+        # configured loss budget when the stop is wide (or equity is small).
         qty = int(risk_budget / stop_distance)
         if qty < 1:
-            qty = 1  # Minimum 1 share if risk budget allows
+            return 0
 
         # Max notional cap (e.g. 50% of account equity)
         max_notional_cash = self.equity * (self.max_notional_pct / 100.0)

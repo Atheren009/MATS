@@ -21,6 +21,8 @@ import pandas as pd
 from ml_system.config import (
     DEFAULT_TIMEFRAME,
     EQUITY_SYMBOLS,
+    GOLD_SYMBOL,
+    GOLD_FUTURES_SYMBOL,
 )
 from ml_system.data.loader import DataLoader
 from ml_system.models.hmm_regime import RegimeHMM
@@ -42,6 +44,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("validation")
 
+# periods_per_year for DSR annualisation — equities trade 6.5h/day on 15-min bars;
+# commodity futures trade ~24h/day.  Must be passed explicitly, never rely on default.
+_PPY_EQUITY   = 252 * 26         # 6.5h/day × 4 bars/h × 252 days
+_PPY_FUTURES  = 252 * 24 * 4     # 24h/day × 4 bars/h × 252 days
+_FUTURES_SYMS = {GOLD_SYMBOL, GOLD_FUTURES_SYMBOL}
+
+
+def _ppy(symbol: str) -> int:
+    """Return the correct periods-per-year for DSR given the instrument."""
+    return _PPY_FUTURES if symbol in _FUTURES_SYMS else _PPY_EQUITY
+
 
 # ---------------------------------------------------------------------------
 # Execution Simulator
@@ -56,7 +69,10 @@ def simulate_trade(signal: Signal, df_1min: pd.DataFrame) -> float:
     QTY = 500
 
     sig_time = pd.to_datetime(signal.timestamp, utc=True)
-    future = df_1min[df_1min.index > sig_time]
+    # sig_time is the 15-min bar's open label; bar closes at sig_time + 15 min.
+    # Never fill on a 1-min bar inside the signal window (lookahead guard).
+    bar_close = sig_time + pd.Timedelta(minutes=15)
+    future = df_1min[df_1min.index >= bar_close]
     if len(future) < 6:
         return 0.0
 
@@ -140,6 +156,7 @@ def _run_fold_stats(
     df_1min_oos: pd.DataFrame,
     use_lstm: bool,
     n_trials: int,
+    periods_per_year: int = 252 * 26,   # equity default; override for GC/XAUUSD
 ) -> dict:
     """
     Shared helper: evaluate signals, compute DSR+SPA stats, log results,
@@ -151,8 +168,10 @@ def _run_fold_stats(
     df_ret = pd.concat([daily_lstm.rename("lstm"), daily_base.rename("base")], axis=1).fillna(0.0)
 
     # --- Statistics ---
-    # periods_per_year = 252*26 (equity 15-min bars; corrected from 252*24*4)
-    dsr   = deflated_sharpe_ratio(df_ret["lstm"], expected_sr=0.0, n_trials=n_trials)
+    dsr   = deflated_sharpe_ratio(
+        df_ret["lstm"], expected_sr=0.0, n_trials=n_trials,
+        periods_per_year=periods_per_year,
+    )
     spa_p = block_bootstrap_spa(df_ret["lstm"], df_ret["base"])
 
     base_pnl      = df_ret["base"].sum()
@@ -181,6 +200,87 @@ def _run_fold_stats(
 
 
 # ---------------------------------------------------------------------------
+# Single-fold execution core (shared by all three walk-forward variants)
+# ---------------------------------------------------------------------------
+
+def _run_one_fold(
+    fold: int,
+    symbol: str,
+    df_train: pd.DataFrame,
+    df_oos: pd.DataFrame,
+    df_1min_oos: pd.DataFrame,
+    use_lstm: bool,
+    n_trials: int,
+    hmm_symbol: str | None = None,
+    train_loader: DataLoader | None = None,
+    oos_loader: DataLoader | None = None,
+    feature_hash_tag: str = "baseline_v2",
+    registry: RetrainLog | None = None,
+) -> dict:
+    """
+    Fit HMM on df_train, optionally train LSTM, generate signals on df_oos,
+    simulate PnL, run DSR/SPA stats, and optionally log to registry.
+
+    Parameters
+    ----------
+    hmm_symbol   : symbol to use for the HMM (may differ from signal symbol
+                   in the fixed-fold transfer case).
+    train_loader : DataLoader instance for the training symbol (LSTM features).
+    oos_loader   : DataLoader instance for the OOS symbol (may differ in transfer).
+    """
+    hmm_sym     = hmm_symbol or symbol
+    t_loader    = train_loader
+    o_loader    = oos_loader
+
+    # 1. HMM
+    hmm = RegimeHMM(symbol=hmm_sym)
+    hmm.fit(df_train)
+    regimes_oos = hmm.predict(df_oos)
+
+    # 2. (Optional) LSTM
+    lstm_probs = None
+    if use_lstm and t_loader is not None and o_loader is not None:
+        regimes_train = hmm.predict(df_train)
+        lstm_features_train = t_loader.compute_lstm_features(df_train, regimes_train)
+        lstm = SignalFilterLSTM(hmm_sym)
+        lstm.fit(lstm_features_train)
+        lstm_features_oos = o_loader.compute_lstm_features(df_oos, regimes_oos)
+        lstm_probs = lstm.predict(lstm_features_oos)
+
+    # 3. Signals
+    gen = BaselineSignalGenerator(symbol=symbol)
+    sig_base = gen.generate(df_oos, regimes_oos)
+    sig_lstm = gen.generate(df_oos, regimes_oos, lstm_probs=lstm_probs) if use_lstm else sig_base
+
+    log.info("  Phase 0 signals: %d  |  Phase 1 (LSTM-filtered): %d", len(sig_base), len(sig_lstm))
+
+    # 4. Stats
+    result = _run_fold_stats(
+        fold=fold, symbol=symbol,
+        sig_base=sig_base, sig_lstm=sig_lstm,
+        df_1min_oos=df_1min_oos,
+        use_lstm=use_lstm, n_trials=n_trials,
+        periods_per_year=_ppy(symbol),
+    )
+
+    # 5. Registry (optional)
+    if registry is not None:
+        registry.log_training_run(
+            symbol=symbol,
+            train_start=str(df_train.index[0]),
+            train_end=str(df_train.index[-1]),
+            train_bars=len(df_train),
+            regime_distribution=hmm.regime_distribution(df_train),
+            feature_set_hash=f"{feature_hash_tag}_fold{fold}",
+            log_likelihood=0.0,
+            n_states=4,
+            model_path="",
+        )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Walk-Forward
 # ---------------------------------------------------------------------------
 
@@ -188,32 +288,28 @@ def run_walk_forward(symbol: str, n_folds: int = 3, use_lstm: bool = False) -> D
     """
     Expanding-window walk-forward validation for one symbol.
     Streams 1-min data → resamples to 15-min inside each fold.
-    Returns a summary dict.
+    Returns a list of per-fold result dicts.
     """
     log.info("=" * 60)
     log.info("Walk-Forward: %s  (%d folds, LSTM=%s)", symbol, n_folds, use_lstm)
     log.info("=" * 60)
 
     loader  = DataLoader(symbol)
-    df_1min = loader.load()              # raw 1-min cache
-
-    # Full 15-min features (for fold slicing)
-    df_resampled = loader.resample(DEFAULT_TIMEFRAME)
-    df_features  = loader.compute_features(df_resampled)
+    df_1min = loader.load()
+    df_features = loader.compute_features(loader.resample(DEFAULT_TIMEFRAME))
 
     total_bars = len(df_features)
     min_train  = min(6000, int(total_bars * 0.4))
     oos_size   = max(100, (total_bars - min_train) // n_folds)
 
-    registry = RetrainLog()
+    registry     = RetrainLog()
     fold_results = []
 
     for fold in range(n_folds):
         train_end = min_train + fold * oos_size
         oos_end   = min(train_end + oos_size, total_bars)
-
-        df_train = df_features.iloc[:train_end]
-        df_oos   = df_features.iloc[train_end:oos_end]
+        df_train  = df_features.iloc[:train_end]
+        df_oos    = df_features.iloc[train_end:oos_end]
 
         if len(df_oos) < 50:
             log.warning("Fold %d: not enough OOS bars, skipping.", fold + 1)
@@ -224,53 +320,16 @@ def run_walk_forward(symbol: str, n_folds: int = 3, use_lstm: bool = False) -> D
                  df_train.index[0].date(), df_train.index[-1].date(), len(df_train),
                  df_oos.index[0].date(), df_oos.index[-1].date(), len(df_oos))
 
-        # 1. HMM
-        hmm = RegimeHMM(symbol=symbol)
-        hmm.fit(df_train)
-        regimes_oos = hmm.predict(df_oos)
+        oos_start = df_oos.index[0]
+        df_1min_oos = df_1min[(df_1min.index >= oos_start) & (df_1min.index <= df_oos.index[-1])]
 
-        # 2. (Optional) LSTM
-        lstm_probs = None
-        if use_lstm:
-            regimes_train = hmm.predict(df_train)
-            lstm_features_train = loader.compute_lstm_features(df_train, regimes_train)
-            lstm = SignalFilterLSTM(symbol)
-            lstm.fit(lstm_features_train)
-            lstm_features_oos = loader.compute_lstm_features(df_oos, regimes_oos)
-            lstm_probs = lstm.predict(lstm_features_oos)
-
-        # 3. Signals — baseline vs filtered (15-min streaming simulation)
-        gen = BaselineSignalGenerator(symbol=symbol)
-        sig_base = gen.generate(df_oos, regimes_oos)
-        sig_lstm = gen.generate(df_oos, regimes_oos, lstm_probs=lstm_probs) if use_lstm else sig_base
-
-        log.info("  Phase 0 signals: %d  |  Phase 1 (LSTM-filtered): %d", len(sig_base), len(sig_lstm))
-
-        # 4. Simulate PnL through Smart Router using 1-min data
-        oos_start  = df_oos.index[0]
-        oos_end_ts = df_oos.index[-1]
-        df_1min_oos = df_1min[(df_1min.index >= oos_start) & (df_1min.index <= oos_end_ts)]
-
-        result = _run_fold_stats(
+        result = _run_one_fold(
             fold=fold + 1, symbol=symbol,
-            sig_base=sig_base, sig_lstm=sig_lstm,
-            df_1min_oos=df_1min_oos,
+            df_train=df_train, df_oos=df_oos, df_1min_oos=df_1min_oos,
             use_lstm=use_lstm, n_trials=fold + 1,
+            train_loader=loader, oos_loader=loader,
+            feature_hash_tag="baseline_v2", registry=registry,
         )
-
-        # 5. Registry
-        registry.log_training_run(
-            symbol=symbol,
-            train_start=str(df_train.index[0]),
-            train_end=str(df_train.index[-1]),
-            train_bars=len(df_train),
-            regime_distribution=hmm.regime_distribution(df_train),
-            feature_set_hash=f"baseline_v2_fold{fold+1}",
-            log_likelihood=0.0,
-            n_states=4,
-            model_path="",
-        )
-
         fold_results.append(result)
 
     return fold_results
@@ -279,25 +338,21 @@ def run_walk_forward(symbol: str, n_folds: int = 3, use_lstm: bool = False) -> D
 def run_alternating_walk_forward(symbol: str, use_lstm: bool = False) -> List[Dict]:
     """
     Alternating-block walk-forward validation for one symbol.
-    Slices the dataset into 10% blocks.
-    Strictly alternates: 1 block Train -> 1 block OOS -> next block Train ...
-    Produces 5 folds (20% of data per fold: 10% train, 10% test).
+    Strictly alternates 10% Train → 10% OOS blocks.  Produces 5 folds.
     """
     log.info("=" * 60)
     log.info("Alternating Walk-Forward: %s  (10%% Train / 10%% OOS blocks, LSTM=%s)", symbol, use_lstm)
     log.info("=" * 60)
 
     loader  = DataLoader(symbol)
-    df_1min = loader.load()              # raw 1-min cache
-
-    df_resampled = loader.resample(DEFAULT_TIMEFRAME)
-    df_features  = loader.compute_features(df_resampled)
+    df_1min = loader.load()
+    df_features = loader.compute_features(loader.resample(DEFAULT_TIMEFRAME))
 
     total_bars = len(df_features)
     block_size = int(total_bars * 0.10)
-    n_folds = 5
+    n_folds    = 5
 
-    registry = RetrainLog()
+    registry     = RetrainLog()
     fold_results = []
 
     for fold in range(n_folds):
@@ -318,56 +373,19 @@ def run_alternating_walk_forward(symbol: str, use_lstm: bool = False) -> List[Di
                  df_train.index[0].date(), df_train.index[-1].date(), len(df_train),
                  df_oos.index[0].date(), df_oos.index[-1].date(), len(df_oos))
 
-        # 1. HMM
-        hmm = RegimeHMM(symbol=symbol)
-        hmm.fit(df_train)
-        regimes_oos = hmm.predict(df_oos)
+        df_1min_oos = df_1min[(df_1min.index >= df_oos.index[0]) & (df_1min.index <= df_oos.index[-1])]
 
-        # 2. (Optional) LSTM
-        lstm_probs = None
-        if use_lstm:
-            regimes_train = hmm.predict(df_train)
-            lstm_features_train = loader.compute_lstm_features(df_train, regimes_train)
-            lstm = SignalFilterLSTM(symbol)
-            lstm.fit(lstm_features_train)
-            lstm_features_oos = loader.compute_lstm_features(df_oos, regimes_oos)
-            lstm_probs = lstm.predict(lstm_features_oos)
-
-        # 3. Signals — baseline vs filtered (15-min streaming simulation)
-        gen = BaselineSignalGenerator(symbol=symbol)
-        sig_base = gen.generate(df_oos, regimes_oos)
-        sig_lstm = gen.generate(df_oos, regimes_oos, lstm_probs=lstm_probs) if use_lstm else sig_base
-
-        log.info("  Phase 0 signals: %d  |  Phase 1 (LSTM-filtered): %d", len(sig_base), len(sig_lstm))
-
-        # 4. Simulate PnL through Smart Router using 1-min data
-        oos_start_ts = df_oos.index[0]
-        oos_end_ts   = df_oos.index[-1]
-        df_1min_oos  = df_1min[(df_1min.index >= oos_start_ts) & (df_1min.index <= oos_end_ts)]
-
-        result = _run_fold_stats(
+        result = _run_one_fold(
             fold=fold + 1, symbol=symbol,
-            sig_base=sig_base, sig_lstm=sig_lstm,
-            df_1min_oos=df_1min_oos,
+            df_train=df_train, df_oos=df_oos, df_1min_oos=df_1min_oos,
             use_lstm=use_lstm, n_trials=fold + 1,
+            train_loader=loader, oos_loader=loader,
+            feature_hash_tag="baseline_v2_alt", registry=registry,
         )
-
-        # 5. Registry
-        registry.log_training_run(
-            symbol=symbol,
-            train_start=str(df_train.index[0]),
-            train_end=str(df_train.index[-1]),
-            train_bars=len(df_train),
-            regime_distribution=hmm.regime_distribution(df_train),
-            feature_set_hash=f"baseline_v2_alt_fold{fold+1}",
-            log_likelihood=0.0,
-            n_states=4,
-            model_path="",
-        )
-
         fold_results.append(result)
 
     return fold_results
+
 
 
 def extract_fold_windows(anchor_symbol: str = "AAPL", n_folds: int = 3) -> List[Dict]:
@@ -404,38 +422,42 @@ def extract_fold_windows(anchor_symbol: str = "AAPL", n_folds: int = 3) -> List[
 
 def run_fixed_folds(target_symbol: str, fold_windows: List[Dict], anchor_symbol: str = "AAPL", use_lstm: bool = False) -> List[Dict]:
     """
-    Test a target symbol purely Out-Of-Sample, using regime models trained on an anchor symbol
-    over the exact same calendar windows.
+    Test a target symbol purely Out-Of-Sample using regime models trained on
+    an anchor symbol over the exact same calendar windows.
     """
     log.info("=" * 60)
     log.info("Fixed-Fold Transfer: %s (Anchor: %s, LSTM=%s)", target_symbol, anchor_symbol, use_lstm)
     log.info("=" * 60)
 
     anchor_loader = DataLoader(anchor_symbol)
-    anchor_1min = anchor_loader.load()
+    anchor_1min   = anchor_loader.load()
     anchor_features = anchor_loader.compute_features(anchor_loader.resample(DEFAULT_TIMEFRAME))
 
     target_loader = DataLoader(target_symbol)
-    
-    # Check if target needs fetching
     if target_symbol not in ["AAPL", "MSFT", "SPY"]:
         from ml_system.data.alpaca_fetcher import AlpacaFetcher
         fetcher = AlpacaFetcher()
         anchor_start = anchor_1min.index[0].to_pydatetime()
-        anchor_end = anchor_1min.index[-1].to_pydatetime()
-        df_target_raw = fetcher.fetch_if_missing(target_symbol, start=anchor_start, end=anchor_end, timeframe_minutes=1 if target_symbol != "GC" else 60)
+        anchor_end   = anchor_1min.index[-1].to_pydatetime()
+        df_target_raw = fetcher.fetch_if_missing(
+            target_symbol, start=anchor_start, end=anchor_end,
+            timeframe_minutes=1 if target_symbol != "GC" else 60,
+        )
         target_loader.set_dataframe(df_target_raw)
 
-    target_1min = target_loader.load() if target_loader._df_1min is None else target_loader._df_1min
+    target_1min    = target_loader.load() if target_loader._df_1min is None else target_loader._df_1min
     target_features = target_loader.compute_features(target_loader.resample(DEFAULT_TIMEFRAME))
 
     fold_results = []
 
     for w in fold_windows:
         fold = w["fold"]
-        
-        df_train_anchor = anchor_features[(anchor_features.index >= w["train_start"]) & (anchor_features.index <= w["train_end"])]
-        df_oos_target = target_features[(target_features.index >= w["oos_start"]) & (target_features.index <= w["oos_end"])]
+        df_train_anchor = anchor_features[
+            (anchor_features.index >= w["train_start"]) & (anchor_features.index <= w["train_end"])
+        ]
+        df_oos_target = target_features[
+            (target_features.index >= w["oos_start"]) & (target_features.index <= w["oos_end"])
+        ]
 
         if len(df_oos_target) < 50:
             log.warning("Fold %d: Target %s not enough OOS bars, skipping.", fold, target_symbol)
@@ -446,35 +468,19 @@ def run_fixed_folds(target_symbol: str, fold_windows: List[Dict], anchor_symbol:
                  df_train_anchor.index[0].date(), df_train_anchor.index[-1].date(), len(df_train_anchor),
                  df_oos_target.index[0].date(), df_oos_target.index[-1].date(), len(df_oos_target))
 
-        hmm = RegimeHMM(symbol=anchor_symbol)
-        hmm.fit(df_train_anchor)
-        regimes_oos = hmm.predict(df_oos_target)
+        df_1min_oos = target_1min[
+            (target_1min.index >= df_oos_target.index[0]) &
+            (target_1min.index <= df_oos_target.index[-1])
+        ]
 
-        lstm_probs = None
-        if use_lstm:
-            regimes_train_anchor = hmm.predict(df_train_anchor)
-            lstm_features_train = anchor_loader.compute_lstm_features(df_train_anchor, regimes_train_anchor)
-            lstm = SignalFilterLSTM(anchor_symbol)
-            lstm.fit(lstm_features_train)
-            
-            lstm_features_oos = target_loader.compute_lstm_features(df_oos_target, regimes_oos)
-            lstm_probs = lstm.predict(lstm_features_oos)
-
-        gen = BaselineSignalGenerator(symbol=target_symbol)
-        sig_base = gen.generate(df_oos_target, regimes_oos)
-        sig_lstm = gen.generate(df_oos_target, regimes_oos, lstm_probs=lstm_probs) if use_lstm else sig_base
-
-        log.info("  Phase 0 signals: %d  |  Phase 1 (LSTM-filtered): %d", len(sig_base), len(sig_lstm))
-
-        oos_start = df_oos_target.index[0]
-        oos_end_ts = df_oos_target.index[-1]
-        df_1min_oos = target_1min[(target_1min.index >= oos_start) & (target_1min.index <= oos_end_ts)]
-
-        result = _run_fold_stats(
+        result = _run_one_fold(
             fold=fold, symbol=target_symbol,
-            sig_base=sig_base, sig_lstm=sig_lstm,
-            df_1min_oos=df_1min_oos,
-            use_lstm=use_lstm, n_trials=fold,
+            df_train=df_train_anchor, df_oos=df_oos_target, df_1min_oos=df_1min_oos,
+            use_lstm=use_lstm, n_trials=fold + 1,
+            hmm_symbol=anchor_symbol,
+            train_loader=anchor_loader, oos_loader=target_loader,
+            feature_hash_tag=None,   # no registry logging for transfer folds
+            registry=None,
         )
         fold_results.append(result)
 

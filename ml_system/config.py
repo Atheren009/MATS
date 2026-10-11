@@ -24,18 +24,27 @@ REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Alpaca credentials (paper account)
-# Override via env vars ALPACA_API_KEY / ALPACA_SECRET_KEY if preferred.
+# Set ALPACA_API_KEY and ALPACA_SECRET_KEY in your environment.
+# Never commit literal key strings — the system raises at import if unset.
 # ---------------------------------------------------------------------------
 
-ALPACA_API_KEY = os.getenv(
-    "ALPACA_API_KEY",
-    "PKFQLQNP2YEP3TDBLBZK4KLOQR",
-)
-ALPACA_SECRET_KEY = os.getenv(
-    "ALPACA_SECRET_KEY",
-    "HDJDXuciMzoa9RfuLuEXRrcnS8k3pDcNmZY7qZMUzPZZ",
-)
-ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
+_alpaca_api_key    = os.getenv("ALPACA_API_KEY")
+_alpaca_secret_key = os.getenv("ALPACA_SECRET_KEY")
+
+if not _alpaca_api_key:
+    raise RuntimeError(
+        "Environment variable ALPACA_API_KEY is not set. "
+        "Export it before starting the trading system."
+    )
+if not _alpaca_secret_key:
+    raise RuntimeError(
+        "Environment variable ALPACA_SECRET_KEY is not set. "
+        "Export it before starting the trading system."
+    )
+
+ALPACA_API_KEY    = _alpaca_api_key
+ALPACA_SECRET_KEY = _alpaca_secret_key
+ALPACA_BASE_URL   = "https://paper-api.alpaca.markets"
 
 # ---------------------------------------------------------------------------
 # Symbols
@@ -46,7 +55,11 @@ EQUITY_SYMBOLS = ["AAPL", "MSFT", "SPY"]
 ANCHOR_SYMBOLS = ["AAPL", "MSFT", "SPY"]
 # QQQ is the NAS100 ETF proxy — tested 100% OOS using anchor-trained HMMs
 # DIA is the Dow Jones Industrial Average ETF — traded via Alpaca 1-min data
-ALPACA_EXTRA_SYMBOLS = ["QQQ", "DIA"]
+# DAX is the Global X DAX Germany ETF — German 30/40 index proxy on Alpaca
+# EWG is the iShares MSCI Germany ETF — large-cap Germany equity proxy
+GERMAN_30_SYMBOL = "DAX"
+GERMAN_ETF_SYMBOL = "EWG"
+ALPACA_EXTRA_SYMBOLS = ["QQQ", "DIA", "DAX", "EWG"]
 GOLD_SYMBOL = "XAUUSD"
 # GC is Gold Futures via yfinance 1h — tested 100% OOS
 GOLD_FUTURES_SYMBOL = "GC"
@@ -62,6 +75,10 @@ CSV_PATHS: dict[str, Path] = {
     "QQQ":  DATA_DIR / "QQQ_1min_2024-2026.csv",
     # DIA — Dow Jones Industrial Average ETF, fetched from Alpaca 1-min
     "DIA":  DATA_DIR / "DIA_1min_2024-2026.csv",
+    # DAX — Global X DAX Germany ETF (German 30 proxy, Alpaca 1-min)
+    "DAX":  DATA_DIR / "DAX_1min_2024-2026.csv",
+    # EWG — iShares MSCI Germany ETF (Alpaca 1-min)
+    "EWG":  DATA_DIR / "EWG_1min_2024-2026.csv",
     # GC — Gold Futures 15-min CSV (Jul-Sep 2026, yfinance)
     "GC":   DATA_DIR / "GC_15min_2026.csv",
 }
@@ -77,9 +94,9 @@ YFINANCE_TICKERS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 PAPER_EQUITY       = 5_000.0      # Software-enforced equity cap
-RISK_PER_TRADE_PCT = 0.5          # 0.5% risk per trade = $25
+RISK_PER_TRADE_PCT = 0.25         # Capital-preservation default: $12.50 per $5k
 DEFAULT_TIMEFRAME  = "15min"
-MAX_DRAWDOWN_PCT   = 10.0         # Kill switch: halt trading if equity DD > 10%
+MAX_DRAWDOWN_PCT   = 5.0          # Kill switch: halt trading if equity DD reaches 5%
 
 # ---------------------------------------------------------------------------
 # HMM Configuration
@@ -140,6 +157,24 @@ COST_MODEL: dict[str, dict] = {
         "commission_per_share": 0.0,
         "slippage_bps": 0.5,
     },
+    # DIA — Dow Jones ETF, commission-free on Alpaca
+    "DIA": {
+        "spread_bps": 0.5,
+        "commission_per_share": 0.0,
+        "slippage_bps": 0.5,
+    },
+    # DAX — Global X DAX Germany ETF (German 30 proxy)
+    "DAX": {
+        "spread_bps": 1.5,
+        "commission_per_share": 0.0,
+        "slippage_bps": 1.5,
+    },
+    # EWG — iShares MSCI Germany ETF
+    "EWG": {
+        "spread_bps": 1.0,
+        "commission_per_share": 0.0,
+        "slippage_bps": 1.0,
+    },
     "XAUUSD": {
         "spread_pips": 0.35,             # Raw ECN
         "swap_long_usd_per_lot": -3.50,  # Overnight funding
@@ -174,6 +209,26 @@ LSTM_PROB_THRESH   = 0.5     # Decision threshold for the filter
 
 # Note: Using generic features (PDH/PDL distance, session high/low, regime/session one-hots)
 # instead of SMC features (OB/FVG) for MVP, to avoid definitional drift from live EA.
+
+# ---------------------------------------------------------------------------
+# Multi-Agent Orchestration (Phase C)
+# ---------------------------------------------------------------------------
+
+# DSR/SPA promotion gates (applied after backtest, before paper-live)
+ORCH_DSR_THRESHOLD   = 0.0    # Deflated Sharpe must be positive
+ORCH_SPA_THRESHOLD   = 0.10   # Block-bootstrap SPA p < 10%
+
+# Correlation gate: candidate vs every funded agent
+ORCH_CORR_THRESHOLD  = 0.5    # Pearson |r| must be strictly below this
+
+# Capital allocator dwell window: regime must hold this many 15-min bars
+# before any reallocation fires.  Prevents churning on regime flickers.
+ORCH_DWELL_WINDOW    = 8
+
+# Maximum concurrently-funded agents.
+# Raise only after the 2nd agent has a clean paper-live run.
+ORCH_MAX_AGENTS      = 2
+
 
 # ---------------------------------------------------------------------------
 # GPU Detection (for Phase 1 LSTM)
