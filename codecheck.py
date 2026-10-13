@@ -3,9 +3,15 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 from datetime import datetime
+import os
 
-API_KEY = "PKFQLQNP2YEP3TDBLBZK4KLOQR"
-SECRET_KEY = "HDJDXuciMzoa9RfuLuEXRrcnS8k3pDcNmZY7qZMUzPZZ"
+API_KEY = os.getenv("ALPACA_API_KEY")
+SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+
+if not API_KEY:
+    raise RuntimeError("Environment variable ALPACA_API_KEY is not set.")
+if not SECRET_KEY:
+    raise RuntimeError("Environment variable ALPACA_SECRET_KEY is not set.")
 
 client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
