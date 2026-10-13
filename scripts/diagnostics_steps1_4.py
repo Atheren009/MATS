@@ -32,9 +32,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-os.environ.setdefault("ALPACA_API_KEY",    "PKFQLQNP2YEP3TDBLBZK4KLOQR")
-os.environ.setdefault("ALPACA_SECRET_KEY", "HDJDXuciMzoa9RfuLuEXRrcnS8k3pDcNmZY7qZMUzPZZ")
-
 from ml_system.config import MODEL_DIR, CSV_PATHS, DEFAULT_TIMEFRAME
 from ml_system.data.loader import DataLoader
 from ml_system.models.hmm_regime import RegimeHMM
